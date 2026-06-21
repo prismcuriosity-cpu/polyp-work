@@ -1,0 +1,50 @@
+model:
+  name: depth-anything/Depth-Anything-V2-Large-hf
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  n_quantiles: 3
+
+training:
+  epochs: 30
+  batch_size: 8
+  num_workers: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  use_amp: true
+  max_grad_norm: 1.0
+  calib_every_n_epochs: 5
+
+  loss_weights:
+    pinball: 1.0
+    silog: 0.5
+    illum: 0.1
+    width: 0.01
+    mono: 0.1
+
+conformal:
+  alpha: 0.10          # target miscoverage level (90% coverage)
+  delta: 0.05          # RCPS confidence level
+  score_type: quantile  # quantile | scale_aligned
+  pixel_quantile: 0.90  # within-frame aggregation quantile
+  estimate_shift: false
+
+data:
+  c3vd:
+    use_v2: true
+    depth_scale: 1000.0    # metres → mm
+    max_depth_mm: 150.0
+    transform_size: 518
+
+  simcol3d:
+    depth_scale: 0.1       # raw pixel / 10 = mm
+    max_depth_mm: 150.0
+
+  endoslam:
+    max_depth_mm: 150.0
+    organs: [Colon, SmallIntestine, Stomach]
+
+logging:
+  output_dir: outputs/default_run
+  log_wandb: false
+  wandb_project: conformal-depth-endoscopy

@@ -1,0 +1,42 @@
+# Ablation study configurations
+# Run with: python scripts/train.py --config configs/ablation.yaml
+
+defaults:
+  - default
+
+# Ablation variants (override individually)
+ablations:
+  # A1: No LoRA (full fine-tuning of head only)
+  no_lora:
+    model:
+      lora_r: 0
+
+  # A2: No illumination loss
+  no_illum:
+    training:
+      loss_weights:
+        illum: 0.0
+
+  # A3: Standard CP only (no RCPS)
+  standard_cp_only:
+    conformal:
+      delta: null   # disable RCPS
+
+  # A4: No video-exchangeability correction
+  no_shift_correction:
+    conformal:
+      estimate_shift: false
+
+  # A5: Small model (ViT-B instead of ViT-L)
+  vit_base:
+    model:
+      name: depth-anything/Depth-Anything-V2-Base-hf
+
+  # A6: Coverage levels
+  alpha_05:
+    conformal:
+      alpha: 0.05
+
+  alpha_20:
+    conformal:
+      alpha: 0.20
