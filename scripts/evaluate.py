@@ -7,6 +7,10 @@ Runs evaluation on:
   - SimCol3D (synthetic, coverage stress-test)
   - EndoSLAM (ex-vivo, transfer)
 
+Baselines (enabled with --baselines):
+  - ZoeDepth zero-shot (Intel/zoedepth-nk, metric output in mm)
+  - Depth-Anything V2 Large zero-shot (relative depth, scale-aligned at eval)
+
 Reports:
   - Depth metrics (AbsRel, RMSE, δ<1.25, SILog)
   - Conformal coverage vs. nominal at calibrated q̂
@@ -14,6 +18,7 @@ Reports:
   - Width–coverage calibration curve
   - Polyp sizing: MAE, RMSE, CCC, 3-group accuracy
   - Confusion matrix
+  - Per-baseline comparison table
 
 Usage:
     python scripts/evaluate.py \
@@ -24,7 +29,9 @@ Usage:
         --endoslam_root /data/endoslam \
         --kvasir_root /data/kvasir-seg \
         --output_dir outputs/eval_01 \
-        [--baselines]
+        --baselines \
+        [--zoedepth_model Intel/zoedepth-nk] \
+        [--da_model depth-anything/Depth-Anything-V2-Large-hf]
 """
 
 import argparse
@@ -43,6 +50,7 @@ from tqdm import tqdm
 from conformal_depth.models import (
     ConformalDepthModel,
     DepthAnythingZeroShot,
+    ZoeDepthWrapper,
     MCDropoutWrapper,
 )
 from conformal_depth.data import (
@@ -173,12 +181,75 @@ def parse_args():
     p.add_argument("--endoslam_root",  default=None)
     p.add_argument("--kvasir_root",    default=None)
     p.add_argument("--output_dir",     default="outputs/eval")
-    p.add_argument("--baselines",      action="store_true")
+    p.add_argument("--baselines",      action="store_true",
+                   help="Run ZoeDepth and Depth-Anything baselines alongside ConformalDepth")
+    p.add_argument("--zoedepth_model", default="Intel/zoedepth-nk",
+                   choices=["Intel/zoedepth-nk", "Intel/zoedepth-n", "Intel/zoedepth-k"],
+                   help="ZoeDepth variant: nk=NYU+KITTI, n=NYU only, k=KITTI only")
+    p.add_argument("--da_model",       default="depth-anything/Depth-Anything-V2-Large-hf",
+                   help="Depth-Anything model for zero-shot baseline")
     p.add_argument("--batch_size",     type=int, default=4)
     p.add_argument("--num_workers",    type=int, default=4)
     p.add_argument("--model",          default="depth-anything/Depth-Anything-V2-Large-hf")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
+
+
+def _build_dataset_loaders(args) -> dict[str, DataLoader | None]:
+    """Return {name: DataLoader} for every active dataset root."""
+    loaders = {}
+    if args.c3vd_root:
+        ds = C3VDDataset(root=args.c3vd_root, split="test")
+        loaders["c3vd"] = DataLoader(
+            ds, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
+        )
+    if args.simcol_root:
+        ds = SimCol3DDataset(root=args.simcol_root, split="test")
+        loaders["simcol3d"] = DataLoader(
+            ds, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
+        )
+    if args.endoslam_root:
+        ds = EndoSLAMDataset(root=args.endoslam_root, split="test")
+        loaders["endoslam"] = DataLoader(
+            ds, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
+        )
+    return loaders
+
+
+def _run_on_datasets(
+    model_name: str,
+    model: torch.nn.Module,
+    loaders: dict,
+    device: torch.device,
+    q_hat: float,
+    alpha: float,
+    output_dir: str,
+) -> dict:
+    """Evaluate one model across all datasets. Returns nested results dict."""
+    results = {}
+    for ds_name, loader in loaders.items():
+        print(f"  [{model_name}] {ds_name}…")
+        res = evaluate_model(model, loader, device, q_hat=q_hat)
+        results[ds_name] = {k: v for k, v in res.items() if not k.startswith("_")}
+        dm = res.get("depth_metrics", {})
+        print(
+            f"    AbsRel={dm.get('abs_rel', float('nan')):.4f}  "
+            f"RMSE={dm.get('rmse', float('nan')):.2f}mm  "
+            f"δ<1.25={dm.get('d1', float('nan')):.3f}  "
+            f"Cov(pad)={res.get('coverage_padded', float('nan')):.3f}"
+        )
+        if ds_name == "c3vd":
+            wcc = res.get("wcc", {})
+            if wcc:
+                fig = plot_coverage_calibration(
+                    wcc["q_hats"], wcc["coverages"], wcc["widths"],
+                    nominal_alpha=alpha,
+                    save_path=os.path.join(
+                        output_dir, f"{ds_name}_{model_name}_wcc.png"
+                    ),
+                )
+                plt_close(fig)
+    return results
 
 
 def main():
@@ -193,117 +264,102 @@ def main():
     alpha = calib["alpha"]
     print(f"[eval] Using q̂ = {q_hat:.4f} mm  (alpha={alpha})")
 
-    # Load model
-    print(f"[eval] Loading ConformalDepthModel from {args.checkpoint}")
-    model = ConformalDepthModel.from_pretrained(model_name=args.model)
-    ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model_state"])
-    model.to(device).eval()
-
-    all_results = {}
+    # Build dataset loaders (shared across all models)
+    loaders = _build_dataset_loaders(args)
+    if not loaders:
+        print("[eval] No dataset roots provided. Pass at least one of: "
+              "--c3vd_root, --simcol_root, --endoslam_root")
+        return
 
     # ------------------------------------------------------------------
-    # C3VD evaluation
+    # ConformalDepth (primary model)
     # ------------------------------------------------------------------
-    if args.c3vd_root:
-        print("\n[eval] C3VD test split…")
-        ds = C3VDDataset(root=args.c3vd_root, split="test")
-        loader = DataLoader(ds, batch_size=args.batch_size,
-                            num_workers=args.num_workers, shuffle=False)
-        res = evaluate_model(model, loader, device, q_hat=q_hat)
-        all_results["c3vd"] = {
-            k: v for k, v in res.items() if not k.startswith("_")
-        }
-        print(f"  AbsRel={res['depth_metrics']['abs_rel']:.4f}  "
-              f"RMSE={res['depth_metrics']['rmse']:.2f}mm  "
-              f"Coverage={res['coverage_padded']:.3f} (nominal={1-alpha:.2f})")
+    print(f"\n[eval] Loading ConformalDepthModel from {args.checkpoint}")
+    conf_model = ConformalDepthModel.from_pretrained(model_name=args.model)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    conf_model.load_state_dict(ckpt["model_state"])
+    conf_model.to(device).eval()
 
-        # WCC plot
-        wcc = res["wcc"]
-        fig = plot_coverage_calibration(
-            wcc["q_hats"], wcc["coverages"], wcc["widths"],
-            nominal_alpha=alpha,
-            save_path=os.path.join(args.output_dir, "c3vd_wcc.png"),
+    all_results = {"ConformalDepth": _run_on_datasets(
+        "ConformalDepth", conf_model, loaders, device, q_hat, alpha, args.output_dir
+    )}
+    del conf_model   # free VRAM before loading baselines
+
+    # ------------------------------------------------------------------
+    # Baselines
+    # ------------------------------------------------------------------
+    if args.baselines:
+        # --- ZoeDepth ---
+        print(f"\n[eval] ZoeDepth baseline ({args.zoedepth_model})…")
+        zoe = ZoeDepthWrapper(model_name=args.zoedepth_model).to(device).eval()
+        # ZoeDepth outputs metric depth (mm after ×1000); q_hat does not apply
+        # (no conformal calibration for baselines), pass q_hat=0.
+        all_results["ZoeDepth"] = _run_on_datasets(
+            "ZoeDepth", zoe, loaders, device, q_hat=0.0, alpha=alpha,
+            output_dir=args.output_dir
         )
-        plt_close(fig)
+        del zoe
+
+        # --- Depth-Anything V2 zero-shot ---
+        print(f"\n[eval] Depth-Anything V2 baseline ({args.da_model})…")
+        da = DepthAnythingZeroShot(model_name=args.da_model).to(device).eval()
+        all_results["DepthAnything"] = _run_on_datasets(
+            "DepthAnything", da, loaders, device, q_hat=0.0, alpha=alpha,
+            output_dir=args.output_dir
+        )
+        del da
 
     # ------------------------------------------------------------------
-    # SimCol3D evaluation (coverage stress-test)
-    # ------------------------------------------------------------------
-    if args.simcol_root:
-        print("\n[eval] SimCol3D stress test…")
-        ds = SimCol3DDataset(root=args.simcol_root, split="test")
-        loader = DataLoader(ds, batch_size=args.batch_size,
-                            num_workers=args.num_workers, shuffle=False)
-        res = evaluate_model(model, loader, device, q_hat=q_hat)
-        all_results["simcol3d"] = {
-            k: v for k, v in res.items() if not k.startswith("_")
-        }
-        print(f"  Coverage={res['coverage_padded']:.3f} (nominal={1-alpha:.2f})")
-
-    # ------------------------------------------------------------------
-    # EndoSLAM transfer evaluation
-    # ------------------------------------------------------------------
-    if args.endoslam_root:
-        print("\n[eval] EndoSLAM transfer evaluation…")
-        ds = EndoSLAMDataset(root=args.endoslam_root, split="test")
-        loader = DataLoader(ds, batch_size=args.batch_size,
-                            num_workers=args.num_workers, shuffle=False)
-        res = evaluate_model(model, loader, device, q_hat=q_hat)
-        all_results["endoslam"] = {
-            k: v for k, v in res.items() if not k.startswith("_")
-        }
-        print(f"  AbsRel={res['depth_metrics']['abs_rel']:.4f}  "
-              f"δ<1.25={res['depth_metrics']['d1']:.3f}")
-
-    # ------------------------------------------------------------------
-    # Polyp sizing (Kvasir-SEG masks + C3VD depth)
+    # Polyp sizing note
     # ------------------------------------------------------------------
     if args.kvasir_root and args.c3vd_root:
         print("\n[eval] Polyp sizing evaluation (Kvasir-SEG masks)…")
-        # This is a simplified evaluation: for real experiment, match
-        # Kvasir-SEG frames to C3VD sequences with polyp annotations.
-        # Here we demonstrate the API with placeholder GT diameters.
         print("  [Note] Full polyp sizing requires paired (frame, mask, GT_diameter).")
         print("  Provide --kvasir_root with depth-paired frames for full eval.")
 
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
-    # Serialize (remove non-serializable numpy arrays)
-    serializable = {}
-    for dataset, res in all_results.items():
-        serializable[dataset] = {}
-        for k, v in res.items():
-            if isinstance(v, dict):
-                serializable[dataset][k] = {
-                    kk: (vv.tolist() if hasattr(vv, "tolist") else vv)
-                    for kk, vv in v.items()
-                }
-            elif hasattr(v, "tolist"):
-                serializable[dataset][k] = v.tolist()
-            else:
-                serializable[dataset][k] = v
+    def _serialize(v):
+        if isinstance(v, dict):
+            return {kk: _serialize(vv) for kk, vv in v.items()}
+        if hasattr(v, "tolist"):
+            return v.tolist()
+        return v
+
+    serializable = {model_key: _serialize(ds_res)
+                    for model_key, ds_res in all_results.items()}
 
     out_path = os.path.join(args.output_dir, "evaluation_results.json")
     with open(out_path, "w") as f:
         json.dump(serializable, f, indent=2)
     print(f"\n[eval] Results saved to {out_path}")
 
-    # Pretty-print summary table
-    print("\n" + "="*70)
-    print(f"{'Dataset':<15} {'AbsRel':>8} {'RMSE':>8} {'δ<1.25':>8} {'Cov(raw)':>10} {'Cov(pad)':>10} {'Width':>8}")
-    print("="*70)
-    for ds_name, res in all_results.items():
-        dm = res.get("depth_metrics", {})
-        print(f"{ds_name:<15} "
-              f"{dm.get('abs_rel', float('nan')):>8.4f} "
-              f"{dm.get('rmse', float('nan')):>8.2f} "
-              f"{dm.get('d1', float('nan')):>8.3f} "
-              f"{res.get('coverage_raw', float('nan')):>10.3f} "
-              f"{res.get('coverage_padded', float('nan')):>10.3f} "
-              f"{res.get('width_padded', float('nan')):>8.2f}")
-    print("="*70)
+    # ------------------------------------------------------------------
+    # Pretty-print comparison table (one row per model × dataset)
+    # ------------------------------------------------------------------
+    col_w = 18
+    header = (f"{'Model':<{col_w}} {'Dataset':<12} {'AbsRel':>8} "
+              f"{'RMSE':>8} {'δ<1.25':>8} {'SILog':>8} {'Cov(pad)':>10} {'Width':>8}")
+    print("\n" + "=" * len(header))
+    print(header)
+    print("=" * len(header))
+
+    for model_key, ds_results in all_results.items():
+        for ds_name, res in ds_results.items():
+            dm = res.get("depth_metrics", {})
+            print(
+                f"{model_key:<{col_w}} {ds_name:<12} "
+                f"{dm.get('abs_rel', float('nan')):>8.4f} "
+                f"{dm.get('rmse', float('nan')):>8.2f} "
+                f"{dm.get('d1', float('nan')):>8.3f} "
+                f"{dm.get('silog', float('nan')):>8.4f} "
+                f"{res.get('coverage_padded', float('nan')):>10.3f} "
+                f"{res.get('width_padded', float('nan')):>8.2f}"
+            )
+        print("-" * len(header))
+
+    print("=" * len(header))
 
 
 def plt_close(fig):
